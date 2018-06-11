@@ -1,0 +1,289 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import StringIO
+import sys
+import argparse
+
+################################################################################
+##  Parse arguments
+################################################################################
+
+parser = argparse.ArgumentParser(description='heatmap')
+parser.add_argument('-t', '--transpose',   dest='transpose', action='store_true', help='')
+parser.add_argument('-z',                  dest='zpos',                            default=1, type=int, help='')
+parser.add_argument('-d', '--delim',       dest='delim',                           default=' |', help='')
+parser.add_argument('-s', '--scale',       dest='scale',                           default='blue', help='')
+parser.add_argument('-f', '--fill',        dest='fill',      action='store_true',  default=None, help='')
+parser.add_argument('-F', '--no-fill',     dest='fill',      action='store_false', default=None, help='')
+parser.add_argument('-x', '--x-axis',      dest='xaxis',                           default='top', help='')
+parser.add_argument('-y', '--y-axis',      dest='yaxis',                           default='left', help='')
+parser.add_argument('-a', '--annotations', dest='annotations',                     default=None, help='')
+args = parser.parse_args()
+delim1, delim2 = args.delim
+fill = args.fill if args.fill is not None else args.scale not in ['emoji', 'ijome']
+
+xaxis = (args.xaxis + ':>{w}').split(':')
+xposition = xaxis[0]
+xformat = '{:' + xaxis[1] + '}'
+
+yaxis = (args.yaxis + (':>{w}' if args.yaxis.startswith('left') else ':<{w}')).split(':')
+yposition = yaxis[0]
+yformat = '{:' + yaxis[1] + '}'
+
+if args.annotations is None:
+    aposition = 'none' if args.scale == 'number' else 'right' if yposition == 'left' else 'left'
+else:
+    aaxis = (args.annotations + ':').split(':')
+    aposition = aaxis[0]
+
+################################################################################
+##  Parse input
+################################################################################
+
+def column_indexes():
+    columns = [0, 1, 2]
+    z = args.zpos - 1
+    columns.pop(z)
+    x, y = reversed(columns) if args.transpose else columns
+    return x, y, z
+
+X, Y, Z = column_indexes()
+
+def split(line, delim):
+    if delim == ' ':
+        line = line.lstrip()
+        index = line.index(' ')
+        return line[:index], line[index+1:].lstrip()
+    else:
+        index = line.index(delim)
+        return line[:index], line[index+1:]
+
+def parse_columns():
+    for line in sys.stdin:
+        line = line[:-1]
+        a, bc = split(line, delim1)
+        b, c  = split(bc,   delim2)
+        yield a, b, c
+
+def order_columns():
+    for columns in parse_columns():
+        yield columns[X], columns[Y], columns[Z]
+
+min_value = None
+max_value = None
+data = {}
+rows = []
+columns = []
+
+for x, y, z in order_columns():
+    value = float(z)
+    if max_value is None or value > max_value:
+        max_value = value
+    if min_value is None or value < min_value:
+        min_value = value
+
+    data[x, y] = value
+
+    if x not in columns:
+        columns.append(x)
+    if y not in rows:
+        rows.append(y)
+
+################################################################################
+##  Scales
+################################################################################
+
+def color(code, string=' '):
+    return u"\u001b[48;5;%dm%s\u001b[0m" % (code, string)
+
+def color_gradient_scale():
+    scale = []
+
+    r = 0
+    g = 0
+    b = 0
+
+    for i in range(0, 5):
+        g = g + 1
+        scale.append(color(16 + 36 * r + 6 * g + b))
+
+    for i in range(0, 5):
+        b = b + 1
+        scale.append(color(16 + 36 * r + 6 * g + b))
+
+    for i in range(0, 5):
+        g = g - 1
+        scale.append(color(16 + 36 * r + 6 * g + b))
+
+    return scale
+
+def render_char_scale(scale):
+    def render_value(value, width=None):
+        if width is None:
+            return ' '
+        char = scale[bin(value, len(scale))]
+        if fill:
+            return char * width
+        else:
+            return (' ' * (width - 1)) + char
+    return render_value
+
+def round(number):
+    intn = int(number)
+    return intn if float(intn) == float(number) else number
+
+def render_number():
+    def render_value(value, width=0):
+        return (' ' + str(round(value))).rjust(width)
+    return render_value
+
+ijome = [u'😡', u'😰', u'😨', u'😲', u'😩', u'😬', u'😧', u'😉', u'😊', u'😀', u'😎']
+scales = {
+    'gradient': render_char_scale(color_gradient_scale()),
+    'grey':     render_char_scale([color(232 + i) for i in range(0, 24)]),
+    'blue':     render_char_scale([color(16 + i) for i in [1, 2, 3, 4, 5, 11, 17, 23]]),
+    'green':    render_char_scale([color(16 + 6 * i) for i in [0, 1, 2, 3, 4, 5, 11, 17, 23]]),
+    'vert':     render_char_scale(['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']),
+    'horz':     render_char_scale(['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█']),
+    'emoji':    render_char_scale([e for e in reversed(ijome)]),
+    'ijome':    render_char_scale(ijome),
+    'number':   render_number()
+}
+
+################################################################################
+##  Rendering
+################################################################################
+
+def bin(value, n):
+    return n - 1 if value >= max_value else int(float(value - min_value) / (max_value - min_value) * n)
+
+def render_label_x(label, width=0):
+    return xformat.format(label, w=width).ljust(width)
+
+def render_label_y(label, width=0):
+    if yposition == 'left':
+        label = label + ' '
+    if yposition == 'right':
+        label = ' ' + label
+    return yformat.format(label, w=width).ljust(width)
+
+def render_cell(x, y, width=0):
+    value = data.get((x, y), None)
+    if value is None:
+        return ' '.rjust(0 if width is None else width)
+    else:
+        return render_value(value, width)
+
+def render_annotation(y, width=0):
+    if y is None:
+        return ' ' * width
+    ymin, ymax = rows_minmax[y]
+    annotation = '[{:>{m}}, {:>{M}}]'.format('x' if ymin is None else round(ymin), '' if ymax is None else round(ymax), m=max_minmax_min, M=max_minmax_max)
+    if aposition == 'left':
+        annotation = (annotation + ' ').ljust(width)
+    if aposition == 'right':
+        annotation = (' ' + annotation).rjust(width)
+    return annotation
+
+render_value = scales[args.scale]
+
+################################################################################
+##  Math
+################################################################################
+
+rows_minmax = {}
+for y in rows:
+    ymin = None
+    ymax = None
+    for x in columns:
+        value = data.get((x, y), None)
+        if value is not None and (ymin is None or value < ymin):
+            ymin = value
+        if value is not None and (ymax is None or value > ymax):
+            ymax = value
+    rows_minmax[y] = (ymin, ymax)
+
+max_minmax_min = max(
+    [ len(str(round(rows_minmax[y][0]))) for y in rows ]
+)
+
+max_minmax_max = max(
+    [ len(str(round(rows_minmax[y][1]))) for y in rows ]
+)
+
+width_annotation = max(
+    [ len(render_annotation(y)) for y in rows ]
+)
+
+width_label = max(
+    [ len(render_label_y(y + ' ')) for y in rows ]
+) if yposition != 'none' else 0
+
+width_cell = max(
+    ([ len(render_label_x(x + ' ')) for x in columns ] if xposition != 'none' else []) +
+    [ len(render_cell(x, y)) for x in columns for y in rows ]
+)
+
+################################################################################
+##  Sort
+################################################################################
+
+try:
+    rows = sorted(rows)
+except ValueError:
+    pass
+
+try:
+    rows = sorted(rows, key=lambda x: float(x[:-1] if x.endswith('-') or x.endswith('+') else x))
+except ValueError:
+    pass
+
+try:
+    columns = sorted(columns)
+except ValueError:
+    pass
+
+try:
+    columns = sorted(columns, key=int)
+except ValueError:
+    pass
+
+################################################################################
+##  Write heatmap
+################################################################################
+
+def write(string):
+    sys.stdout.write(string)
+
+def write_x_labels():
+    if yposition == 'left':
+        write(render_label_y('', width_label))
+    if aposition == 'left':
+        write(render_annotation(None, width_annotation))
+    for x in columns:
+        write(render_label_x(x, width_cell))
+    if aposition == 'right':
+        write(render_annotation(None, width_annotation))
+    if yposition == 'right':
+        write(render_label_y('', width_label))
+    print
+
+if xposition == 'top':
+    write_x_labels()
+
+for y in rows:
+    if yposition == 'left':
+        write(render_label_y(y, width_label))
+    if aposition == 'left':
+        write(render_annotation(y, width_annotation))
+    for x in columns:
+        write(render_cell(x, y, width_cell))
+    if aposition == 'right':
+        write(render_annotation(y, width_annotation))
+    if yposition == 'right':
+        write(render_label_y(y, width_label))
+    print
+
+if xposition == 'bottom':
+    write_x_labels()
